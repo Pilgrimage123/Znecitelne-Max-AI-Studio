@@ -1,0 +1,208 @@
+// Session Transfer Package (.znecitelne-session)
+// Implements client-side AES-GCM + PBKDF2 encryption/decryption for Four-Eyes review (ADR-0008)
+
+const FORMAT_ID = "znecitelne-session";
+const FORMAT_VERSION = 2;
+const PBKDF2_ITERATIONS = 100000;
+
+export function bufferToBase64(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  if (typeof btoa !== "function" && typeof Buffer !== "undefined") {
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+  }
+  const CHUNK_SIZE = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const chunk = bytes.subarray(i, i + CHUNK_SIZE);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
+}
+
+export function base64ToBuffer(b64) {
+  const clean = String(b64 || "").replace(/\s+/g, "");
+  if (typeof atob !== "function" && typeof Buffer !== "undefined") {
+    const buf = Buffer.from(clean, "base64");
+    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  }
+  const binary = atob(clean);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function deriveKey(password, saltBytes, usage, iterations = PBKDF2_ITERATIONS) {
+  const subtle = globalThis.crypto.subtle;
+  const enc = new TextEncoder();
+  const safeIterations = Number.isInteger(iterations) && iterations >= 1000 && iterations <= 5000000
+    ? iterations
+    : PBKDF2_ITERATIONS;
+  const keyMaterial = await subtle.importKey(
+    "raw",
+    enc.encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+  return subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: saltBytes,
+      iterations: safeIterations,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    usage
+  );
+}
+
+export async function exportSession(state, password, options = {}) {
+  if (!password || typeof password !== "string") {
+    throw new Error("Password is required for encrypting session");
+  }
+  const flate = (typeof window !== "undefined" && window.fflate) || (typeof globalThis !== "undefined" && globalThis.fflate) || (typeof fflate !== "undefined" ? fflate : null);
+  const targetVersion = options.version !== undefined ? options.version : FORMAT_VERSION;
+  const kdfIterations = Number.isInteger(options.iterations) && options.iterations >= 1000 && options.iterations <= 5000000
+    ? options.iterations
+    : PBKDF2_ITERATIONS;
+  const useCompression = targetVersion >= 2 && !!(flate && flate.zlibSync);
+
+  const subtle = globalThis.crypto.subtle;
+  const salt = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(salt);
+
+  const iv = new Uint8Array(12);
+  globalThis.crypto.getRandomValues(iv);
+
+  const key = await deriveKey(password, salt, ["encrypt"], kdfIterations);
+
+  const doc = state.doc || {};
+  const src = state.sourceBuf || doc.sourceBuf || null;
+  const sourceBuf = src ? (src instanceof Uint8Array ? src : new Uint8Array(src)) : null;
+
+  // Payload: state to serialize
+  const payload = {
+    doc: {
+      fileName: state.fileName || doc.fileName,
+      kind: state.kind || doc.kind,
+      text: state.text !== undefined ? state.text : doc.text,
+      pages: state.pages || doc.pages,
+      noTextPages: state.noTextPages !== undefined ? state.noTextPages : (doc.noTextPages || 0),
+      hashIn: state.hashIn || doc.hashIn || "",
+      reviewed: state.reviewed !== undefined ? state.reviewed : doc.reviewed,
+      approvalState: state.approvalState || doc.approvalState || (state.reviewed ? "approved" : "unreviewed"),
+      cellMap: state.cellMap || doc.cellMap,
+      sigDetected: state.sigDetected !== undefined ? state.sigDetected : (doc.sigDetected || false),
+      sourceBuf: sourceBuf ? bufferToBase64(sourceBuf) : null
+    },
+    hits: state.hits,
+    seen: Array.from(state.seen || []),
+    profile: state.profile,
+    mode: state.mode || state.replaceMode,
+    replaceMode: state.replaceMode || state.mode,
+    lang: state.lang,
+    legalReason: state.legalReason,
+    operator: state.operator || "",
+    auditTrail: state.auditTrail || []
+  };
+
+  const enc = new TextEncoder();
+  let plaintextBytes = enc.encode(JSON.stringify(payload));
+
+  if (useCompression) {
+    plaintextBytes = flate.zlibSync(plaintextBytes);
+  }
+
+  const cipherBuffer = await subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    plaintextBytes
+  );
+
+  const envelope = {
+    format: FORMAT_ID,
+    version: targetVersion,
+    compression: useCompression ? "zlib" : "none",
+    timestamp: new Date().toISOString(),
+    kdf: {
+      algorithm: "PBKDF2",
+      iterations: kdfIterations,
+      hash: "SHA-256",
+      salt: bufferToBase64(salt)
+    },
+    cipher: {
+      algorithm: "AES-GCM",
+      iv: bufferToBase64(iv),
+      data: bufferToBase64(cipherBuffer)
+    }
+  };
+
+  return JSON.stringify(envelope, null, 2);
+}
+
+export async function importSession(envelopeJsonOrObj, password) {
+  if (!password || typeof password !== "string") {
+    throw new Error("Password is required for decrypting session");
+  }
+  const envelope = typeof envelopeJsonOrObj === "string" ? JSON.parse(envelopeJsonOrObj) : envelopeJsonOrObj;
+  if (!envelope || envelope.format !== FORMAT_ID) {
+    throw new Error("Invalid session format: expected " + FORMAT_ID);
+  }
+  if (envelope.version !== 1 && envelope.version !== 2) {
+    throw new Error("Unsupported session version: " + envelope.version);
+  }
+
+  const saltBytes = new Uint8Array(base64ToBuffer(envelope.kdf.salt));
+  const ivBytes = new Uint8Array(base64ToBuffer(envelope.cipher.iv));
+  const cipherBytes = base64ToBuffer(envelope.cipher.data);
+  const kdfIterations = envelope.kdf && Number.isInteger(envelope.kdf.iterations)
+    ? envelope.kdf.iterations
+    : PBKDF2_ITERATIONS;
+
+  const key = await deriveKey(password, saltBytes, ["decrypt"], kdfIterations);
+
+  const subtle = globalThis.crypto.subtle;
+  let decryptedBuffer;
+  try {
+    decryptedBuffer = await subtle.decrypt(
+      { name: "AES-GCM", iv: ivBytes },
+      key,
+      cipherBytes
+    );
+  } catch (err) {
+    throw new Error("Decryption failed: incorrect password or corrupted data");
+  }
+
+  let decryptedBytes = new Uint8Array(decryptedBuffer);
+
+  const isCompressed = envelope.compression === "zlib" || (envelope.version === 2 && envelope.compression !== "none");
+  if (isCompressed) {
+    const flate = (typeof window !== "undefined" && window.fflate) || (typeof globalThis !== "undefined" && globalThis.fflate) || (typeof fflate !== "undefined" ? fflate : null);
+    if (!flate || (!flate.unzlibSync && !flate.inflateSync)) {
+      throw new Error("Decompression failed: fflate library is missing");
+    }
+    try {
+      decryptedBytes = flate.unzlibSync(decryptedBytes);
+    } catch (_) {
+      try {
+        decryptedBytes = flate.inflateSync(decryptedBytes);
+      } catch (decompErr) {
+        throw new Error("Decompression failed: " + (decompErr.message || String(decompErr)));
+      }
+    }
+  }
+
+  const dec = new TextDecoder("utf-8");
+  const jsonStr = dec.decode(decryptedBytes);
+  const data = JSON.parse(jsonStr);
+
+  if (data && data.doc && data.doc.sourceBuf && typeof data.doc.sourceBuf === "string") {
+    data.doc.sourceBuf = new Uint8Array(base64ToBuffer(data.doc.sourceBuf));
+  }
+
+  return data;
+}
